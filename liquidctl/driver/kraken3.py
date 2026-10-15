@@ -980,6 +980,9 @@ class KrakenZ3(KrakenX3):
         img = Image.open(path)
         frames = []
         for frame in ImageSequence.Iterator(img):
+            # the lcd has no transparency: show transparent pixels as black
+            frame = frame.convert("RGBA")
+            frame = Image.alpha_composite(Image.new("RGBA", frame.size, (0, 0, 0, 255)), frame)
             rgb = ImageOps.fit(frame.convert("RGB"), self.lcd_resolution, Image.Resampling.LANCZOS)
             rgb = rgb.rotate(rotation * -90)
             pixels = bytearray()
@@ -1010,18 +1013,38 @@ class KrakenZ3(KrakenX3):
         (HID 36 01 00 01 06, bulk header + RGB565 frame, HID 36 02) on the gif's
         own timing. Loops until interrupted or for `seconds`, then restores the
         liquid temperature screen.
+
+        A transfer left unfinished (for example by a previous process that was
+        interrupted mid-frame) makes the device reject new ones, so pending
+        transfers are cancelled (HID 36 03) at the start, when the device reports
+        a failure, and on exit.
         """
         assert self.bulk_device, "Cannot find bulk out device"
         magic = bytes([0x12, 0xFA, 0x01, 0xE8, 0xAB, 0xCD, 0xEF, 0x98, 0x76, 0x54, 0x32, 0x10])
 
+        def ok(data):
+            reply = self._write_then_read_reply(data)
+            return reply is not None and reply[14] == 0x01
+
+        def cancel_transfers():
+            self._write_then_read_reply([0x36, 0x03])
+
         def push(pixels):
-            self._write_then_read_reply([0x36, 0x01, 0x00, 0x01, 0x06])
+            start = [0x36, 0x01, 0x00, 0x01, 0x06]
+            if not ok(start):
+                _LOGGER.debug("start of frame transfer rejected, cancelling pending transfers")
+                cancel_transfers()
+                if not ok(start):
+                    return  # skip this frame, try again with the next one
             self._bulk_write(magic + bytes([0x06, 0, 0, 0]) + len(pixels).to_bytes(4, "little"))
             for i in range(0, len(pixels), self.bulk_buffer_size):
                 self._bulk_write(pixels[i : i + self.bulk_buffer_size])
-            self._write_then_read_reply([0x36, 0x02])
+            if not ok([0x36, 0x02]):
+                _LOGGER.debug("end of frame transfer failed, cancelling pending transfers")
+                cancel_transfers()
 
         self.device.clear_enqueued_reports()
+        cancel_transfers()
         push(frames[0][0])  # first image after init needs to be sent twice
         _LOGGER.info("streaming %d gif frames, interrupt to stop", len(frames))
         start = next_at = time.monotonic()
@@ -1039,6 +1062,7 @@ class KrakenZ3(KrakenX3):
         except KeyboardInterrupt:
             pass
         finally:
+            cancel_transfers()  # in case we were interrupted mid-frame
             self._write_then_read_reply([0x38, 0x01, 0x02, 0x00])  # back to liquid screen
 
     def _send_data(self, data, bulkInfo):

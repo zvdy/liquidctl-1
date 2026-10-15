@@ -554,26 +554,39 @@ def test_krakenz3_screen_not_totally_broken(mock_krakenz3):
 class MockKraken2023Fw2(MockHidapiDevice):
     """Kraken 2023 (1e71:300e) on firmware 2.0.0, with unsolicited 75 02 status reports."""
 
-    def __init__(self):
+    def __init__(self, rejected_starts=0):
         super().__init__(vendor_id=0x1E71, product_id=0x300E)
+        self.rejected_starts = rejected_starts  # frame transfer starts to reject with 0x15
 
     def write(self, data):
         reply = bytearray(64)
         reply[0:2] = [data[0] + 1, data[1]]
+        reply[14] = 0x01  # success
         if data[0:2] == [0x10, 0x01]:
             reply[0x11:0x14] = [2, 0, 0]  # firmware 2.0.0
         elif data[0:2] == [0x30, 0x01]:
             reply[0x14:0x18] = [240, 0, 240, 0]  # lcd resolution
             reply[0x18] = 100  # lcd brightness
             reply[0x1A] = 0  # lcd orientation
+        elif data[0:2] == [0x36, 0x01] and self.rejected_starts:
+            self.rejected_starts -= 1
+            reply[14] = 0x15  # observed after a transfer was left unfinished
         self.preload_read(Report(0, bytes([0x75, 0x02]) + bytes(62)))  # status broadcast
         self.preload_read(Report(0, reply))
         return super().write(data)
 
 
-def test_kraken2023_fw2_streams_gif_frames(monkeypatch):
+START = bytes([0x36, 0x01, 0x00, 0x01, 0x06])
+END = bytes([0x36, 0x02, 0, 0, 0])
+CANCEL = bytes([0x36, 0x03, 0, 0, 0])
+LIQUID = bytes([0x38, 0x01, 0x02, 0x00, 0x00])
+FRAME_LEN = 240 * 240 * 2  # rgb565
+
+
+def _stream_rgb_gif(monkeypatch, raw, pushes):
+    """Stream rgb.gif and simulate ctrl+c on the push after `pushes` frames."""
     dev = KrakenZ3(
-        MockKraken2023Fw2(),
+        raw,
         "Mock Kraken 2023",
         speed_channels=_SPEED_CHANNELS_KRAKENZ,
         color_channels=_COLOR_CHANNELS_KRAKENZ,
@@ -583,37 +596,43 @@ def test_kraken2023_fw2_streams_gif_frames(monkeypatch):
     )
     dev.bulk_device = MockPyusbDevice(0x1E71, 0x300E)
     monkeypatch.setattr("liquidctl.driver.kraken3.time.sleep", lambda _: None)
-
-    frame_count = 3  # frames in rgb.gif
-    frame_len = 240 * 240 * 2  # rgb565
-    pushes = 1 + 2 * frame_count  # first frame is sent twice, then two full loops
     headers = []
 
     def bulk_write(data):
         if len(data) == 20:
             headers.append(bytes(data))
             if len(headers) > pushes:
-                raise KeyboardInterrupt  # simulate ctrl+c on the next frame
+                raise KeyboardInterrupt
         else:
-            assert len(data) == frame_len
+            assert len(data) == FRAME_LEN
 
     dev._bulk_write = bulk_write
     with dev.connect():
         dev.set_screen(
             "lcd", "gif", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rgb.gif")
         )
+    hid = [bytes([r.number] + r.data) for r in dev.device.sent]
+    return headers, [h[:5] for h in hid if h[0] in (0x36, 0x38)]
+
+
+def test_kraken2023_fw2_streams_gif_frames(monkeypatch):
+    pushes = 1 + 2 * 3  # first frame is sent twice, then two loops of rgb.gif's 3 frames
+    headers, commands = _stream_rgb_gif(monkeypatch, MockKraken2023Fw2(), pushes)
 
     magic = bytes.fromhex("12fa01e8abcdef9876543210")
-    assert headers == [magic + bytes([0x06, 0, 0, 0]) + frame_len.to_bytes(4, "little")] * (
-        pushes + 1
-    )
+    header = magic + bytes([0x06, 0, 0, 0]) + FRAME_LEN.to_bytes(4, "little")
+    assert headers == [header] * (pushes + 1)
+    assert commands[0] == CANCEL  # clear any transfer left unfinished
+    assert commands[1:-3] == [START, END] * pushes
+    assert commands[-3:] == [START, CANCEL, LIQUID]  # interrupted mid-frame, then cleanup
 
-    hid = [bytes([r.number] + r.data) for r in dev.device.sent]
-    commands = [h[:5] for h in hid if h[0] in (0x36, 0x38)]
-    expected_push = [bytes([0x36, 0x01, 0x00, 0x01, 0x06]), bytes([0x36, 0x02, 0, 0, 0])]
-    assert commands[:-2] == expected_push * pushes
-    assert commands[-2] == bytes([0x36, 0x01, 0x00, 0x01, 0x06])  # interrupted mid-frame
-    assert commands[-1] == bytes([0x38, 0x01, 0x02, 0x00, 0x00])  # back to liquid screen
+
+def test_kraken2023_fw2_recovers_from_rejected_transfer(monkeypatch):
+    raw = MockKraken2023Fw2(rejected_starts=1)
+    headers, commands = _stream_rgb_gif(monkeypatch, raw, pushes=2)
+
+    assert len(headers) == 3
+    assert commands[:5] == [CANCEL, START, CANCEL, START, END]  # rejected, cancelled, retried
 
 
 @pytest.mark.skip("Currently broken with pillow >= 10.2.0 (see #661)")
