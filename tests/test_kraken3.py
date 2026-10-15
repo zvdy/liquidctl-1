@@ -551,6 +551,71 @@ def test_krakenz3_screen_not_totally_broken(mock_krakenz3):
     )
 
 
+class MockKraken2023Fw2(MockHidapiDevice):
+    """Kraken 2023 (1e71:300e) on firmware 2.0.0, with unsolicited 75 02 status reports."""
+
+    def __init__(self):
+        super().__init__(vendor_id=0x1E71, product_id=0x300E)
+
+    def write(self, data):
+        reply = bytearray(64)
+        reply[0:2] = [data[0] + 1, data[1]]
+        if data[0:2] == [0x10, 0x01]:
+            reply[0x11:0x14] = [2, 0, 0]  # firmware 2.0.0
+        elif data[0:2] == [0x30, 0x01]:
+            reply[0x14:0x18] = [240, 0, 240, 0]  # lcd resolution
+            reply[0x18] = 100  # lcd brightness
+            reply[0x1A] = 0  # lcd orientation
+        self.preload_read(Report(0, bytes([0x75, 0x02]) + bytes(62)))  # status broadcast
+        self.preload_read(Report(0, reply))
+        return super().write(data)
+
+
+def test_kraken2023_fw2_streams_gif_frames(monkeypatch):
+    dev = KrakenZ3(
+        MockKraken2023Fw2(),
+        "Mock Kraken 2023",
+        speed_channels=_SPEED_CHANNELS_KRAKENZ,
+        color_channels=_COLOR_CHANNELS_KRAKENZ,
+        hwmon_ctrl_mapping=_HWMON_CTRL_MAPPING_KRAKENZ,
+        bulk_buffer_size=1024 * 1024 * 2,
+        lcd_resolution=(240, 240),
+    )
+    dev.bulk_device = MockPyusbDevice(0x1E71, 0x300E)
+    monkeypatch.setattr("liquidctl.driver.kraken3.time.sleep", lambda _: None)
+
+    frame_count = 3  # frames in rgb.gif
+    frame_len = 240 * 240 * 2  # rgb565
+    pushes = 1 + 2 * frame_count  # first frame is sent twice, then two full loops
+    headers = []
+
+    def bulk_write(data):
+        if len(data) == 20:
+            headers.append(bytes(data))
+            if len(headers) > pushes:
+                raise KeyboardInterrupt  # simulate ctrl+c on the next frame
+        else:
+            assert len(data) == frame_len
+
+    dev._bulk_write = bulk_write
+    with dev.connect():
+        dev.set_screen(
+            "lcd", "gif", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rgb.gif")
+        )
+
+    magic = bytes.fromhex("12fa01e8abcdef9876543210")
+    assert headers == [magic + bytes([0x06, 0, 0, 0]) + frame_len.to_bytes(4, "little")] * (
+        pushes + 1
+    )
+
+    hid = [bytes([r.number] + r.data) for r in dev.device.sent]
+    commands = [h[:5] for h in hid if h[0] in (0x36, 0x38)]
+    expected_push = [bytes([0x36, 0x01, 0x00, 0x01, 0x06]), bytes([0x36, 0x02, 0, 0, 0])]
+    assert commands[:-2] == expected_push * pushes
+    assert commands[-2] == bytes([0x36, 0x01, 0x00, 0x01, 0x06])  # interrupted mid-frame
+    assert commands[-1] == bytes([0x38, 0x01, 0x02, 0x00, 0x00])  # back to liquid screen
+
+
 @pytest.mark.skip("Currently broken with pillow >= 10.2.0 (see #661)")
 def test_krakenz3_screen_not_totally_broken_part2(mock_krakenz3):
     """Reasonable example calls to untested APIs do not raise exceptions."""
